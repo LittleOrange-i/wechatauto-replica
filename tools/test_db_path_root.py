@@ -146,6 +146,43 @@ old_style = probe_under_old_impl()
 check("旧写法定位不到（证明这套断言真能咬住回归）", old_style, None)
 check("换回新写法立刻又能定位", probe_under_new_impl(), TRUE_ROOT)
 
+print("\n--- G. 盘符无关：本机每个真实盘 + 假想的 E:/Z: 都要一视同仁 ---")
+import string                                    # noqa: F403
+for letter in string.ascii_uppercase[:6] + "Z":  # A-F 与 Z，含本机存在的 C/D
+    drv = letter + ":"
+    check("%s:\\ 规范化后仍是盘根且绝对" % letter,
+          (_abs_root(drv + SEP), os.path.isabs(_abs_root(drv + SEP))),
+          (drv + SEP, True))
+    only = _abs_root(drv)                        # 只给盘符（旧写法在这必翻车）
+    check("%s: 裸盘符补成分隔符后 join 是绝对路径" % letter,
+          os.path.isabs(os.path.join(only, "xwechat_files")), True)
+
+# 旧写法在真实盘上的解析目标确实会随「该盘当前目录」漂移（E:\ 不存在时跳过）
+for letter in ("c", "d"):
+    drv = letter + ":" + SEP
+    if not os.path.isdir(drv):
+        continue
+    old_cand = os.path.join(letter + ":", "xwechat_files")
+    subs = [p for p in os.listdir(letter + ":") if os.path.isdir(letter + SEP + p)]
+    if not subs:
+        continue
+    probe_a, probe_b = None, None
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(letter + ":" + SEP + subs[0])
+        probe_a = os.path.abspath(old_cand)
+    finally:
+        os.chdir(old_cwd)
+    try:
+        os.chdir(drv)
+        probe_b = os.path.abspath(old_cand)
+    finally:
+        os.chdir(old_cwd)
+    check("%s 盘上旧写法的解析目标随该盘当前目录漂移（%s ≠ %s）"
+          % (letter.upper(), probe_a, probe_b), probe_a == probe_b, False)
+    check("%s 盘上新写法恒为 %sxwechat_files" % (letter.upper(), drv),
+          os.path.join(_abs_root(drv), "xwechat_files"), drv + "xwechat_files")
+
 print("\n结果：%d 通过 / %d 失败" % (len(PASSED), len(FAILED)))
 for n in FAILED:
     print("  失败:", n)
