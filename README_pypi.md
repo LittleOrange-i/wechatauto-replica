@@ -32,7 +32,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.5
+> 当前版本：1.2.5.1
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.13 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -85,10 +85,37 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 > 感谢 [uiharukazari0105](https://github.com/uiharukazari0105) 发现语音数据分片存储（`media_1.db` 等）从未被搜索的问题（v1.1.4 修复）。
 >
 > 感谢 [wenjiavv](https://github.com/wenjiavv) 报告 [issue #28](https://github.com/fanyuantaier/wechatauto-replica/issues/28)（1.2.2.5 缺失 `import threading`，布局校准必抛 `NameError`）与 [issue #29](https://github.com/fanyuantaier/wechatauto-replica/issues/29)（发送回读校验接受包含额外正文的历史消息），两份都附了复现步骤、宽屏/竖屏的不同症状和修复建议（v1.2.2.6 修复）。
+>
+> 感谢 [dhz1145](https://github.com/dhz1145) 报告 [issue #32](https://github.com/fanyuantaier/wechatauto-replica/issues/32)：微信存储位置设在盘符根（`d:\`）时自动检测依赖启动目录。附了逐条复现步骤（换启动目录的对照输出）、成因定位、`GetFullPathNameW` 的路径解析复核和修复建议（v1.2.5.1 修复）。
 
 ---
 
 ## 版本记录
+
+### v1.2.5.1（2026-10-07）
+
+- ⚠️ **重要修复：微信数据目录设在盘符根（配置里写 `d:\`）时，自动检测开始依赖启动目录。**（[issue #32](https://github.com/fanyuantaier/wechatauto-replica/issues/32)）
+  - 现象：同一个 Python、同一份依赖、同一个微信配置，**只换个工作目录**就从"能读"变成
+    `RuntimeError: 未找到微信数据库目录，请通过 db_dir 参数手动指定`。
+  - 原因：`_locate_account_root()` 用 `rstrip("\/")` 去掉尾分隔符，把 `d:\` 变成了 `d:`；
+    而 `d:` 在 Windows 上是**盘符相对路径**，`os.path.join('d:', 'xwechat_files')` 得到
+    `d:xwechat_files`，会按**该盘自己的当前目录**解析（不是进程工作目录，更反直觉）。
+  - **影响范围：v1.0.0 ~ v1.2.5 全部版本**（这行代码从初始提交就是现在这个写法，不是回归）。
+  - 为什么多数人没遇到：需要两个条件同时成立——① 存储位置选成了裸盘根（选 `E:\xwechat_files`
+    这类"盘符+子目录"的，rstrip 什么都不改）；② 恰好在那个盘的非根目录里工作（数据放 E 盘
+    而一直在 C 盘跑 Python 的人，E 盘的该盘当前目录还停在 `E:\`，畸形路径反而解析正确）。
+    所以它表现为"我没改任何东西，昨天能读今天读不到"。
+  - 修法：新增 `_abs_root()`，用 `os.path.normpath` 保留盘根语义，并把只写盘符没写分隔符的
+    输入（`d:`）补成 `d:\`；`_locate_account_root()` 与 `_extract_path_from_config()` 里三处
+    同族写法全部改用它，候选保证是绝对路径。UNC 根不受影响。
+  - **暂时不能升级的绕法**：给 `WeChatDB(db_dir=...)` 显式传账号目录的父目录（绝对路径），
+    或不要把微信存储位置设在裸盘根。
+  - 判据：新增 `tools/test_db_path_root.py` **40 项**——假文件系统下以 `d:\` 为 root 必须定位到
+    `d:\xwechat_files`（**含反向验**：把实现换回旧 `rstrip`，同一用例必须返回 `None`，证明断言真能
+    咬住回归）；A–F 与 Z 六个盘符逐个验规范行为；本机真实盘上做「该盘当前目录漂移」对照，
+    证明旧写法在两个启动目录下解析到不同位置；本机真库在 4 个启动目录下结果一致。
+- 其余内容同 v1.2.5（通讯录标签 + 右键转发、发送前回读校验、`WxParam.ENABLE_OCR` 总开关、
+  会话名占位符尾巴、置顶/前台锁/剪贴板三处静默失效）。
 
 ### v1.2.5（2026-10-07）
 
@@ -918,7 +945,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.5 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
+> **Current version:** 1.2.5.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -1109,6 +1136,18 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.5.1 (2026-10-07)
+
+- ⚠️ **Important fix: when WeChat's storage location is a drive root (the config holds `d:\`), auto-detection started depending on the working directory.** ([issue #32](https://github.com/fanyuantaier/wechatauto-replica/issues/32))
+  - Symptom: same Python, same dependencies, same WeChat config — just a different working directory turns "works" into `RuntimeError: 未找到微信数据库目录，请通过 db_dir 参数手动指定`.
+  - Cause: `_locate_account_root()` stripped the trailing separator with `rstrip("\/")`, turning `d:\` into `d:`. On Windows `d:` is a **drive-relative** path, so `os.path.join('d:', 'xwechat_files')` yields `d:xwechat_files`, resolved against **that drive's own current directory** — not the process working directory.
+  - **Scope: every release from v1.0.0 through v1.2.5** (that line has been unchanged since the initial commit; this is not a regression).
+  - Why most people never hit it: two conditions must hold together — ① the storage location is a bare drive root (a value like `E:\xwechat_files` is untouched by the strip), and ② work happens somewhere on that same drive (keep the data on E: while always running Python from C: and E:'s per-drive current directory stays at `E:\`, so the malformed path happens to resolve correctly). That is why it looks like "nothing changed, but yesterday it worked".
+  - Fix: new `_abs_root()` keeps root semantics via `os.path.normpath` and also repairs a drive letter written without a separator (`d:` → `d:\`); all three sites of this pattern in `_locate_account_root()` and `_extract_path_from_config()` now use it, so candidates are always absolute. UNC roots are unaffected.
+  - **Workaround without upgrading**: pass the account directory's parent explicitly as `WeChatDB(db_dir=...)`, or don't put WeChat's storage at a bare drive root.
+  - Tests: new `tools/test_db_path_root.py`, **40 checks** — under a fake filesystem a `d:\` root must resolve to `d:\xwechat_files` (**with a negative control**: reverting the implementation to the old `rstrip` makes the same check return `None`, proving the assertions actually bite); each of drive letters A–F and Z checked individually; the per-drive-current-directory drift is demonstrated live on the real drives; the live database is detected identically from 4 working directories.
+- Everything else is as in v1.2.5 (contact labels + forwarding, the read-back gate before Enter, the `WxParam.ENABLE_OCR` master switch, the chat-name placeholder tail, and three silently-broken window behaviours).
 
 ### v1.2.5 (2026-10-07)
 
@@ -1373,6 +1412,8 @@ Thanks to [maozhitao12450](https://github.com/maozhitao12450) for reporting the 
 Thanks to [uiharukazari0105](https://github.com/uiharukazari0105) for finding that voice data stored in `media_1.db` (and later) was never searched (fixed in v1.1.4).
 
 Thanks to [wenjiavv](https://github.com/wenjiavv) for reporting the missing `threading` import that broke layout calibration in the published 1.2.2.5 ([#28](https://github.com/fanyuantaier/wechatauto-replica/issues/28)) and the substring/no-watermark hole in send verification ([#29](https://github.com/fanyuantaier/wechatauto-replica/issues/29)), both with reproductions and fix proposals (fixed in v1.2.2.6).
+
+Thanks to [dhz1145](https://github.com/dhz1145) for reporting [issue #32](https://github.com/fanyuantaier/wechatauto-replica/issues/32) — auto-detection depended on the working directory whenever WeChat's storage location was a drive root (`d:\`), complete with step-by-step reproductions, the root cause, a `GetFullPathNameW` cross-check and a fix proposal (fixed in v1.2.5.1).
 
 ## 📄 License & Disclaimer
 
