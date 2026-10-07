@@ -3049,7 +3049,7 @@ def _extract_path_from_config(content: str) -> Optional[str]:
         return content
     m = re.search(r"[A-Za-z]:[\\/][^\s\x00-\x1f\"']+", content)
     if m:
-        return m.group(0).rstrip("\\/")
+        return _abs_root(m.group(0))        # 不能用 rstrip：'d:\\' 会变成 'd:'（盘符相对）
     return None
 
 
@@ -3098,6 +3098,21 @@ def _registry_data_dirs() -> List[str]:
     return dirs
 
 
+def _abs_root(path: str) -> str:
+    """把目录路径规范化成绝对路径，尤其修好「盘符根目录」这一类。
+
+    以前这里用 ``rstrip("\\\\/")`` 去掉尾分隔符，于是 ``d:\\`` 变成 ``d:`` ——
+    而 ``d:`` 在 Windows 上是**盘符相对路径**（相对该盘当前目录），
+    ``os.path.join('d:', 'xwechat_files')`` 得到 ``d:xwechat_files``，会按进程在
+    D 盘的当前目录解析：从 ``D:\\`` 启动恰好对，从 ``D:\\某个子目录`` 启动就找错地方
+    （issue #32）。normpath 保留根目录语义；再补一手「只写了盘符没写分隔符」的输入。
+    """
+    p = os.path.normpath(path or "")
+    if re.match(r"^[A-Za-z]:$", p):          # "d:" 这种盘符相对写法
+        p = p + os.sep
+    return p
+
+
 def _locate_account_root(root: Optional[str]) -> Optional[str]:
     """在候选根目录下定位「包含账号目录」的目录。
 
@@ -3109,13 +3124,13 @@ def _locate_account_root(root: Optional[str]) -> Optional[str]:
     """
     if not root or not os.path.isdir(root):
         return None
-    root = root.rstrip("\\/")
+    root = _abs_root(root)
     candidates = [root]
     for name in ("xwechat_files", "WeChat Files", "xwechat_files_data"):
         candidates.append(os.path.join(root, name))
     seen = set()
     for cand in candidates:
-        cand = cand.rstrip("\\/")
+        cand = _abs_root(cand)
         if cand in seen or not os.path.isdir(cand):
             continue
         seen.add(cand)
