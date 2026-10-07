@@ -2150,9 +2150,11 @@ class MediaDownloader:
                     try:
                         btn.Click()
                     except Exception:
+                        from wechatauto import rhythm
                         btn_r = btn.BoundingRectangle
-                        inp.real_click(int((btn_r.left + btn_r.right) / 2),
-                                       int((btn_r.top + btn_r.bottom) / 2))
+                        zx, zy = rhythm.point((btn_r.left, btn_r.top,
+                                               btn_r.right, btn_r.bottom))
+                        inp.real_click(zx, zy)
                 else:
                     wxlog.debug("预览窗缩放键状态=%r（不是「%s」），不点它，等本机出现那一档",
                                 zoom_name or "没有这颗按钮", self.ZOOM_REQUEST)

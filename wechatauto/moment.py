@@ -74,7 +74,8 @@ def _lang(table, key: str) -> str:
     return get_lang(table, key)
 
 
-def _send_scroll(x: int, y: int, delta: int = -120, times: int = 1) -> None:
+def _send_scroll(x: int, y: int, delta: int = -120, times: int = 1,
+                 expect_pid: Optional[int] = None) -> bool:
     """在屏幕坐标 (x, y) 处滚动该窗口。
 
     滚轮事件是按**光标当前位置**投递的。原来的写法把 MOVE 和 WHEEL 连着发、
@@ -83,10 +84,15 @@ def _send_scroll(x: int, y: int, delta: int = -120, times: int = 1) -> None:
     把它当成「已经到底」提前放弃。改成：同步 ``SetCursorPos`` 落位 → 读回确认
     → 稍等目标窗口进入 hover → 再发滚轮。
 
+    ``expect_pid`` 非空时会先确认落点最上层窗口属于该进程，不属于就不发滚轮并
+    返回 False：按坐标盲投曾把滚轮打进压在上面的别的窗口（2026-09-25 自检误跑
+    滚了用户的 IDE）。返回是否真的发出了滚轮。
+
     Args:
         x, y: 目标屏幕坐标（需落在朋友圈时间线区域）。
         delta: 滚轮增量，负=向下滚动(看更早)，正=向上滚动(看最新)。
         times: 重复次数。
+        expect_pid: 落点窗口应有的进程 id（微信）；None 表示不校验。
     """
     import ctypes
     from ctypes import wintypes
@@ -103,6 +109,13 @@ def _send_scroll(x: int, y: int, delta: int = -120, times: int = 1) -> None:
 
     u = ctypes.windll.user32
     x, y = int(x), int(y)
+    if expect_pid is not None:
+        from wechatauto.guia import window_owner_pid
+        owner = window_owner_pid(x, y)
+        if owner is not None and owner != expect_pid:
+            wxlog.warning(f'滚轮落点不属于微信（进程 {owner} != {expect_pid}），'
+                          f'未移动光标也未滚动：{x},{y}')
+            return False
     for _ in range(8):                      # 等光标真的落位（最多 ~0.4s）
         u.SetCursorPos(x, y)
         p = wintypes.POINT()
@@ -115,6 +128,7 @@ def _send_scroll(x: int, y: int, delta: int = -120, times: int = 1) -> None:
         wheel = I(0, MI(0, 0, wintypes.DWORD(int(delta) & 0xFFFFFFFF), WHEEL, 0, 0))
         u.SendInput(1, ctypes.byref(wheel), ctypes.sizeof(I))
         time.sleep(0.05)
+    return True
 
 
 def _is_time_line(text: str) -> bool:
@@ -683,21 +697,35 @@ class Moment:
             return None
 
 
-    def _scroll(self, delta: int = -120, times: int = 1) -> None:
+    def _wechat_pid(self) -> Optional[int]:
+        """微信进程 id；拿不到返回 None（那时不校验落点，保持旧行为）。"""
+        try:
+            return self._wx._gui.pid or None
+        except Exception:
+            return None
+
+
+    def _scroll(self, delta: int = -120, times: int = 1) -> bool:
         """在时间线中心滚动。负 delta=向下(看更早)，正=向上(看最新)。
 
         滚轮和点击一样吃前台状态：微信窗口不是前台窗口时滚轮事件不会落到时间线
         上（实测：非前台时连发三轮，顶部 cell 的 DB 对齐位置一动不动；先确保前台
         后同一份代码立刻 3→6）。`_locate_more_click` 早就为点击写了这一步，滚轮
         这边此前没有，于是 find_moment 把「滚不动」当成「已经到底」提前放弃。
+
+        返回是否真的发出了滚轮：拿不到前台、或时间线中心被别的窗口压住时直接
+        跳过，不把滚轮打给别的应用（2026-09-25 自检误跑滚了用户的 IDE）。
         """
         rect = self._time_line_rect()
         if not rect:
-            return
-        self._ensure_window_foreground()
+            return False
+        if not self._ensure_window_foreground():
+            wxlog.warning('微信未能在前台，滚轮已跳过（避免事件落到别的窗口）')
+            return False
         x = int((rect[0] + rect[2]) // 2)
         y = int((rect[1] + rect[3]) // 2)
-        _send_scroll(x, y, delta=delta, times=times)
+        return _send_scroll(x, y, delta=delta, times=times,
+                            expect_pid=self._wechat_pid())
 
 
     def _scroll_to_top(self, steps: int = 20, chunk: int = 5) -> None:
@@ -710,7 +738,8 @@ class Moment:
         prev = self._visible_fingerprint()
         while remain > 0:
             take = min(chunk, remain)
-            self._scroll(delta=120, times=take)
+            if not self._scroll(delta=120, times=take):
+                return              # 前台/落点不满足，再翻只是空转
             remain -= take
             time.sleep(0.35)
             cur = self._visible_fingerprint()
@@ -1438,8 +1467,17 @@ class Moment:
             right, bottom = r[2], r[3]
             if right - left < 100 or bottom - top < 100:
                 return False
-            x = int((left + right) // 2)
-            y = int(top + 25)
+            # 标题栏中段取点（避开左右两边的按钮/图标），别每次都钉在水平正中
+            x = int(rhythm.spread(left + (right - left) * 0.25,
+                                  left + (right - left) * 0.75))
+            y = int(rhythm.spread(top + 15, top + 30))
+            from wechatauto.guia import window_owner_pid
+            owner = window_owner_pid(x, y)
+            pid = self._wechat_pid()
+            if owner is not None and pid is not None and owner != pid:
+                wxlog.warning(f'前台兜底点击的落点不属于微信（进程 {owner} != {pid}），'
+                              f'已放弃点击：{x},{y}')
+                return False
             pyautogui.FAILSAFE = False
             pyautogui.click(x, y)
             time.sleep(0.5)
@@ -2207,7 +2245,9 @@ class Moment:
         action_button = None
         # 与 _scroll / _locate_more_click 同理：非前台时第一下点击只用来激活窗口，
         # 菜单不会弹，随后 exists(0.5) 判定失败、报「未能打开朋友圈操作菜单」。
-        self._ensure_window_foreground()
+        if not self._ensure_window_foreground():
+            wxlog.warning('微信未能在前台，操作菜单已放弃（避免点击落到别的窗口）')
+            return None
         if not self._reattach_item(item):
             # 死句柄上 RightClick()/Click() 只会抛 "Can not move cursor ...
             # BoundingRectangle is (0,0,0,0)"，先换到新句柄再动手。

@@ -31,6 +31,7 @@ UIA 树会立即物化为 ``mmui::MainWindow``，其中：
 from __future__ import annotations
 
 import ctypes
+import difflib
 import json
 import os
 import re
@@ -50,6 +51,7 @@ except Exception:                                   # pragma: no cover
 
 from wechatauto import rhythm
 from wechatauto.logger import wxlog
+from wechatauto.param import WxParam
 
 # ---------------------------------------------------------------------------
 # 控件锚点
@@ -65,6 +67,28 @@ SESSION_LIST_AID = "session_list"
 SEARCH_LIST_AID = "search_list"
 RESULT_AID_PREFIX = "search_item_"                 # 真实可打开结果的 aid 前缀
 CHAT_INPUT_AID = "chat_input_field"                # 输入框；其 .Name == 当前聊天对象
+# 输入框控件的 Name 是「会话名 + 输入占位符尾巴」拼出来的：框内为空时占位符
+# 会被拼进 Name。2026-10-07 本机 4.1.15.13 实测尾巴是「按住鼠标 语音输入文字」
+# （文件传输助手 → Name = "文件传输助手按住鼠标 语音输入文字"）。不剥掉的话
+# 全库那些 ``current_chat() == who`` 比较统统失效：会话明明已经打开，open_chat
+# 照样返回 False，发送被推去走 OCR/坐标路径（慢且更易错）。
+# 未命中任何尾巴就原样返回，行为与剥之前的版本一致。
+CHAT_NAME_SUFFIXES = ("按住鼠标 语音输入文字", "按住鼠标语音输入文字", "语音输入文字")
+
+
+def _clean_chat_name(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    stripped = name.strip()
+    for suffix in CHAT_NAME_SUFFIXES:
+        if stripped.endswith(suffix):
+            head = stripped[:-len(suffix)].strip()
+            if head:
+                return head
+    return stripped or None
+# 行内表情码：微信输入框把 [微笑] 这类代码渲染成 1 个 U+FFFC 对象占位符
+# （2026-10-04 实测 4.1.15.13），发送前回读比对时要按这个折算。
+_STICKER_CODE = re.compile(r"\[[^\[\]]{1,10}\]")
 
 # ---------------------------------------------------------------------------
 # 新旧版本兼容候选
@@ -1305,7 +1329,7 @@ class WeChatUIA:
 
     def current_chat(self) -> Optional[str]:
         e = self._chat_input()
-        return (e.Name or None) if e else None
+        return (_clean_chat_name(e.Name) if e else None)
 
     def search_box_rect(self) -> Optional[Tuple[int, int, int, int]]:
         """搜索框的物理矩形 (left, top, right, bottom)，拿不到返回 None。
@@ -1566,7 +1590,12 @@ class WeChatUIA:
         return False
 
     def send_text(self, text: str) -> bool:
-        """在已打开会话的输入框发送文本。返回是否成功。"""
+        """在已打开会话的输入框发送文本。返回是否成功。
+
+        回车之前先回读输入框内容比对（阈值 ``WxParam.SEND_CONTENT_RATIO``）：
+        Ctrl+V 有可能整个落空（焦点没落到输入框上），这时按键照样打下去，
+        发出去的会是空消息或上一轮残留的内容。判不达标就不回车并清空。
+        """
         if not self.ensure_window():
             return False
         e = self._chat_input()
@@ -1575,6 +1604,16 @@ class WeChatUIA:
         self._paste_into(e, text, clear=True)
         rhythm.gate('send')
         rhythm.nap(0.2)
+        ok, got, score = self._paste_landed(e, text)
+        if not ok:
+            wxlog.warning(
+                "内容未落进输入框（相似度 %.2f < 阈值 %.2f），不回车；读回=%r",
+                score, float(WxParam.SEND_CONTENT_RATIO), (got or "")[:80])
+            try:
+                e.SendKeys("{Ctrl}a{Delete}", waitTime=0.05)
+            except Exception:
+                pass
+            return False
         try:
             e.SendKeys("{Enter}", waitTime=0.05)
         except Exception:
@@ -1917,8 +1956,62 @@ class WeChatUIA:
         self._clip_set(text)
         try:
             ctrl.SendKeys("{Ctrl}v", waitTime=0.05)
+        except Exception as e:
+            # 落不进去时由 send_text 的回读校验拦下回车，这里不静默当作成功。
+            wxlog.debug("Ctrl+V 投递异常：%s", e)
+
+    @staticmethod
+    def _read_edit_value(ctrl) -> Optional[str]:
+        """读输入框当前内容；控件不暴露值时返回 None（表示"读不到"，不是"空"）。
+
+        本依赖版本的 ``Control`` 没有 ``GetValue()``，只能走 pattern：
+        ``ValuePattern`` 优先，``LegacyIAccessiblePattern`` 兜底。
+        """
+        try:
+            vp = ctrl.GetValuePattern()
+            if vp is not None:
+                return vp.Value
         except Exception:
             pass
+        try:
+            ap = ctrl.GetLegacyIAccessiblePattern()
+            if ap is not None:
+                return ap.Value
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _compare_norm(text: str) -> str:
+        """比对用归一化：折叠空白，并把表情码折算成输入框里的占位符。
+
+        实测（微信 4.1.15.13 / ``mmui::ChatInputField``）：传入的 ``[微笑]`` 在
+        输入框里是 1 个 U+FFFC 对象替换符，整串表情码不在了。两侧都折算才能对上，
+        否则「好的[微笑]」只有 0.444，会被阈值误拦。大小写、全半角、标点的
+        差异不作废——那些是真差异。
+        """
+        return _STICKER_CODE.sub("￼", "".join((text or "").split()))
+
+    @classmethod
+    def _paste_landed(cls, ctrl, text: str) -> Tuple[bool, str, float]:
+        """回读输入框并与待发内容比相似度。返回 (是否达标, 读回值, 相似度)。
+
+        读不回值时判达标 —— 没有探测能力不等于内容错了。若把"读不到"当失败，
+        控件改版哪天不暴露 ValuePattern 了，发送功能会全线锁死。
+        """
+        need = float(getattr(WxParam, "SEND_CONTENT_RATIO", 0.6) or 0)
+        if need <= 0:
+            return True, "", 1.0
+        got = cls._read_edit_value(ctrl)
+        if got is None:
+            wxlog.debug("输入框不暴露内容，跳过发送前回读校验")
+            return True, "", 1.0
+        want = cls._compare_norm(text)
+        have = cls._compare_norm(got)
+        if not want:
+            return True, got, 1.0
+        score = difflib.SequenceMatcher(None, want, have, autojunk=False).ratio()
+        return score >= need, got, score
 
     # ------------------------------------------------------------------ 消息列表定位
     def _message_list(self, win=None):
