@@ -2181,6 +2181,47 @@ class WeChatDB:
                 return None
         return None
 
+    # ------------------------------------------------------------------
+    # 联系人标签（contact.db 的 contact_label 表，无需 UI）
+    # ------------------------------------------------------------------
+    def list_labels(self) -> List[dict]:
+        """读「标签」定义：[{label_id, name, sort_order}]，按 sort_order 排。
+
+        表名/列名带下划线后缀（``contact_label(label_id_, label_name_,
+        sort_order_)``，本机 4.1.15.13 实测 2 行）。整表读不出来时返回 ``[]``
+        而不是抛——标签列表是校验用的旁路，不该让主流程挂在这上面。
+        """
+        conn = self._contact_conn()
+        if conn is None:
+            return []
+        try:
+            rows = conn.execute(
+                "SELECT label_id_, label_name_, sort_order_ FROM contact_label "
+                "ORDER BY sort_order_, label_id_").fetchall()
+        except Exception:
+            # 老版本没这张表 / 微信正在 checkpoint：退化，不抛
+            return []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        out = []
+        for r in rows:
+            try:
+                out.append({
+                    "label_id": r["label_id_"],
+                    "name": r["label_name_"] or "",
+                    "sort_order": r["sort_order_"],
+                })
+            except Exception:
+                continue
+        return out
+
+    def label_names(self) -> List[str]:
+        """所有标签名（给「这个标签存不存在」这类判断用）。"""
+        return [x["name"] for x in self.list_labels() if x.get("name")]
+
     def get_groups(self) -> List[dict]:
         """列出所有群聊。
 

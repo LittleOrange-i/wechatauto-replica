@@ -3265,15 +3265,19 @@ def t_cli() -> None:
           cli.expand_aliases(["--version"]) == ["--version"])
 
     seen = []
+    goes = []
+    acts = []
 
     def rec(name):
         def _f(a):
             seen.append((name, getattr(a, "chat", None), getattr(a, "text", None)))
+            goes.append(bool(getattr(a, "go", False)))
+            acts.append(getattr(a, "action", None))
             return 0
         return _f
 
     names = ("cmd_messages", "cmd_export", "cmd_images", "cmd_send", "cmd_listen",
-             "cmd_sessions", "cmd_moments", "cmd_doctor")
+             "cmd_sessions", "cmd_moments", "cmd_doctor", "cmd_labels", "cmd_forward")
     o = {n: getattr(cli, n) for n in names}
     o_ask, o_db = cli._ask, cli._db
     for n in names:
@@ -3299,7 +3303,56 @@ def t_cli() -> None:
         check("菜单里发消息默认带 --verify（发完自己回读确认）",
               ("send", None, "你好") in seen, str(seen))
         seen.clear()
-        ans = iter(["9", "0"])
+        ans = iter(["9", "list", "0"])          # 标签 → 动作 list → 退出
+        cli._ask = lambda prompt="": next(ans)
+        rc, txt5 = cap(cli.menu)
+        check("菜单：选 9 → 跑的是 labels，且把动作传下去",
+              seen[:1] == [("labels", None, None)], str(seen))
+        seen.clear()
+        goes.clear()
+        ans = iter(["9", "send", "同学", "周五校庆放假", "n", "0"])   # 群发 → 不确认
+        rc, txt6 = cap(cli.menu)
+        check("菜单里 send 第一遍是预演，不确认就一笔都不发",
+              [s[0] for s in seen] == ["labels"] and goes == [False]
+              and "没确认" in txt6, str(seen) + str(goes))
+        seen.clear()
+        goes.clear()
+        ans = iter(["9", "send", "同学", "周五校庆放假", "y", "0"])    # 群发 → 确认
+        rc, txt7 = cap(cli.menu)
+        check("菜单里 send 确认之后第二遍才带 --go",
+              goes == [False, True], str(goes))
+        seen.clear()
+        acts.clear()
+        ans = iter(["9", "rename", "同学", "老同学", "0"])   # 改名 = 老名 + 新名
+        rc, txt8 = cap(cli.menu)
+        check("菜单里 rename 走通了（动作传到 labels，--to 这个参数 argparse 认）",
+              acts[:1] == ["rename"] and seen[:1] == [("labels", None, None)],
+              str(acts) + str(seen))
+        seen.clear()
+        acts.clear()
+        goes.clear()
+        # 菜单第 10 项 = 转发：l=整个标签，再问在哪个会话里右键
+        ans = iter(["10", "l", "同学", "", "n", "0"])
+        rc, txt9 = cap(cli.menu)
+        check("菜单里 forward 先预演，不确认真发就不发",
+              seen[:1] == [("forward", None, None)] and goes == [False]
+              and "没确认" in txt9,
+              str(seen) + str(goes) + txt9.strip()[-40:])
+        seen.clear()
+        acts.clear()
+        goes.clear()
+        ans = iter(["10", "n", "文件传输助手", "", "y", "0"])
+        rc, txt10 = cap(cli.menu)
+        check("菜单里 forward 确认之后第二遍才带 --go",
+              [s[0] for s in seen] == ["forward", "forward"]
+              and goes == [False, True],
+              str(seen) + str(goes))
+        seen.clear()
+        # 编号从 _MENU 里挑，别写死：上一版写死 9，菜单加到第 9 项后这条
+        # 测的就不是「按错」而是真跑了 labels。
+        bad = next(k for k in ("12", "z", "99")
+                   if k not in [m[0] for m in cli._MENU])
+        ans = iter([bad, "0"])
         rc, txt4 = cap(cli.menu)
         check("按错编号只说「没有这个选项」，既不退也不跑东西",
               "没有这个选项" in txt4 and not seen, txt4.strip()[:40])

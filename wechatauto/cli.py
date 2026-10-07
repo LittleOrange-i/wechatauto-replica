@@ -329,6 +329,155 @@ def cmd_moments(args):
     return 0
 
 
+# ------------------------------------------------------------------ 标签
+def cmd_forward(args):
+    """右键「转发」一条消息，分别发给指定人或整个标签（默认只预演）。"""
+    from wechatauto.wx import WeChat
+    wx = WeChat()
+    dry = not args.go
+    if args.label:
+        r = wx.ForwardToLabel(args.label, chat=args.chat, match=args.match,
+                              text=args.text,
+                              dry_run=dry, limit=args.limit, chunk=args.chunk,
+                              verify=not args.no_verify)
+    else:
+        who = [w.strip() for w in (args.to or "").replace("，", ",").split(",")
+               if w.strip()]
+        if not who:
+            return _die("转发给谁？--to 名字1,名字2 或 --label 标签名")
+        r = wx.ForwardMessage(who, chat=args.chat, match=args.match,
+                              text=args.text,
+                              dry_run=dry, chunk=args.chunk,
+                              verify=not args.no_verify)
+    print("[%s] %s" % (r["status"], r.get("message")))
+    data = r.get("data") or {}
+    if data.get("seed"):
+        print("  先发给：%s（原件）" % data["seed"])
+    for k in ("sent", "failed", "skipped"):
+        got = data.get(k) or []
+        if got:
+            if k == "skipped":
+                print("  跳过：%s" % "、".join(
+                    "%s（%s）" % (x.get("display") or x.get("name") or x,
+                                  x.get("reason", "")) if isinstance(x, dict) else x
+                    for x in got[:20]))
+            else:
+                print("  %s：%s" % ({"sent": "已发", "failed": "失败"}[k],
+                                    "、".join(
+                                        (x.get("display") if isinstance(x, dict) else x)
+                                        for x in got[:20])))
+    if dry and r["status"] == "成功":
+        print("  （预演：一条都没发出去。加 --go 才真发）")
+    return 0 if r["status"] == "成功" else 1
+
+
+def cmd_labels(args):
+    """通讯录标签：列表走库（不碰窗口），建/加/移走界面。"""
+    action = args.action
+    if action == "list":
+        if getattr(args, "ui", False):
+            from wechatauto.wx import WeChat      # 只有真要驱动界面时才 import
+            r = WeChat().ListLabels(prefer="ui")
+            rows = (r.get("data") or {}).get("labels") or []
+            for x in rows:
+                cnt = x.get("count")
+                print("     %s%s" % (x["name"],
+                                     "" if cnt is None else "  %d 人" % cnt))
+            print("[%s] %s（读自界面左栏，含微信自己显示的人数）"
+                  % (r["status"], r.get("message")))
+            return 0 if r["status"] == "成功" else 1
+        db = _db()
+        try:
+            rows = db.list_labels()
+        except Exception as e:
+            print("读不到标签表：%s（这个微信版本可能没有 contact_label）" % e)
+            return 1
+        for r in rows:
+            print("%-4s %s" % (r["label_id"], r["name"]))
+        print("共 %d 个标签（读自 contact.db，没有动窗口）" % len(rows))
+        print("  删掉的标签在库里会滞后（实测：界面上没了，这里还留着）——"
+              "要准数加 --ui")
+        return 0
+
+    from wechatauto.wx import WeChat          # 只有真要驱动界面时才 import
+    wx = WeChat()
+    if action == "probe":
+        r = wx.ProbeLabels(dump_dir=args.dump)
+    elif action == "create":
+        r = wx.CreateLabel(args.label)
+    elif action == "delete":
+        r = wx.DeleteLabel(args.label)
+    elif action == "members":
+        r = wx.LabelMembers(args.label, limit=args.limit)
+    elif action == "send":
+        if not (args.text or "").strip():
+            print("要发什么？--text \"...\"")
+            return 2
+        if not args.go and not args.dry_run:
+            print("批量发送默认**不真发**：加 --dry-run 只看收件人，加 --go 才真的发出去。")
+            return 2
+        r = wx.SendToLabel(args.text, args.label, dry_run=not args.go,
+                           limit=args.limit, verify=True)
+    elif action == "rename":
+        new = (args.to or "").strip()
+        if not new:
+            print("改名要给新名字：--label 老名 --to 新名")
+            return 2
+        r = wx.RenameLabel(args.label, new)
+    else:
+        members = [m for m in (args.members or "").replace("，", ",").split(",")
+                   if m.strip()]
+        if not members:
+            print("要 --members 谁？逗号分隔，例：--members 小明,小红")
+            return 2
+        if action == "remove":
+            r = wx.RemoveLabelMembers(args.label, members)
+        else:
+            r = wx.AddLabelMembers(args.label, members)
+    print("[%s] %s" % (r["status"], r.get("message")))
+    data = r.get("data") or {}
+    if data.get("reason"):
+        print("  细节：%s" % data["reason"])
+    if data.get("missing"):
+        print("  没弄上：%s" % "、".join(data["missing"]))
+    if data.get("count_before") is not None:
+        print("  成员数：%s → %s" % (data.get("count_before"), data.get("count_after")))
+    names = [x.get("display") for x in (data.get("recipients") or [])]
+    if names:
+        print("  收件人：%s" % "、".join(names[:30])
+              + ("…（共 %d 人）" % len(names) if len(names) > 30 else ""))
+    if data.get("skipped"):
+        for sk in data["skipped"][:10]:
+            print("  跳过：%s（%s）" % (sk.get("display"), sk.get("reason")))
+    if action == "send":
+        print(_send_cost_hint(len(names), bool(data.get("dry_run"))))
+    for s in data.get("steps") or []:
+        print("  %-18s %s%s" % (s.get("step"), "OK " if s.get("ok") else "停 ",
+                                s.get("reason", "")))
+        for lab in s.get("labels") or []:
+            print("       %-12s %d 人" % (lab["name"], lab["count"]))
+    return 0 if r["status"] == "成功" else 1
+
+
+def _send_cost_hint(n: int, dry_run: bool) -> str:
+    """按当前 rhythm 档位估一次批量发送要多久——不估就是骗人。"""
+    if dry_run or not n:
+        return "  （预演，一笔都没发）"
+    try:
+        from wechatauto import rhythm
+        snap = rhythm.snapshot()
+        glo, ghi = snap.get("gap") or [2.5, 6.0]
+        burst, cool = snap.get("burst") or 6, snap.get("cooloff") or [30, 75]
+    except Exception:
+        return ""
+    per = (glo + ghi) / 2.0 + 4.0            # 节流间隔 + 开会话/输入/回读
+    rests = max(0, n // max(1, burst)) * ((cool[0] + cool[1]) / 2.0)
+    total = n * per + rests
+    return ("  预计耗时 ≈ %.0f 分钟（%d 人 × ~%.0fs + %d 次冷却，档位 %s）"
+            % (total / 60.0, n, per, rests and n // max(1, burst),
+               snap.get("profile", "natural")))
+
+
 # ------------------------------------------------------------------ 装配
 def build_parser():
     p = argparse.ArgumentParser(
@@ -387,6 +536,42 @@ def build_parser():
     s.add_argument("--limit", type=int, default=10)
     s.add_argument("--me", action="store_true", help="只看自己发的")
     s.add_argument("--json", action="store_true")
+
+    s = add("labels", cmd_labels,
+            "通讯录标签：list/members 读，create/add/remove/delete 改，send 批量发")
+    s.add_argument("action",
+                   choices=["list", "create", "add", "remove", "delete", "rename",
+                            "members", "send", "probe"],
+                   nargs="?", default="list",
+                   help="list=只看有哪些标签（不动窗口）；members=列某标签的全部成员；"
+                        "send=按标签群发；probe=走一遍路径报哪步断")
+    s.add_argument("--label", help="标签名（除 list 外都要给）")
+    s.add_argument("--to", help="rename 的新名字")
+    s.add_argument("--ui", action="store_true",
+                   help="list 时读管理窗左栏（是准数，还带人数，但会动窗口）；"
+                        "不给就只读库")
+    s.add_argument("--members", help="逗号分隔的好友显示名或 wxid，例：小明,小红")
+    s.add_argument("--text", help="send 的正文")
+    s.add_argument("--dry-run", action="store_true",
+                   help="send 时只解析收件人、一笔都不发（默认行为）")
+    s.add_argument("--go", action="store_true", help="send 时真的发出去")
+    s.add_argument("--limit", type=int, help="members/send 最多几个人")
+    s.add_argument("--dump", help="probe 时把每步可见的控件名写到这个目录")
+
+    s = add("forward", cmd_forward,
+            "右键「转发」一条消息：分别发给指定人或整个标签（默认只预演）")
+    s.add_argument("--text", help="正文：给了就先发给名单里第一个人，再把这条转发给剩下的")
+    s.add_argument("--to", help="逗号分隔的收件人，例：文件传输助手,送你挖银子")
+    s.add_argument("--label", help="按标签转发：标签名（收件人=该标签全部成员）")
+    s.add_argument("--chat", help="在哪个会话里右键；不给就用当前打开的会话")
+    s.add_argument("--match", help="按文字定位那一条消息；不给就右键最新一条")
+    s.add_argument("--chunk", type=int, help="一个转发窗勾几个人（默认 9）")
+    s.add_argument("--limit", type=int, help="按标签时最多转发给几个人")
+    s.add_argument("--dry-run", action="store_true",
+                   help="只开窗勾选、核对按钮上的人数，最后点取消（默认行为）")
+    s.add_argument("--go", action="store_true", help="真的发出去")
+    s.add_argument("--no-verify", action="store_true",
+                   help="发完不回读每个人的会话确认（默认回读）")
     return p
 
 
@@ -403,6 +588,8 @@ ALIASES = {
     "发": "send", "发送": "send", "发消息": "send",
     "听": "listen", "监听": "listen",
     "朋友圈": "moments",
+    "标签": "labels", "打标签": "labels", "设标签": "labels",
+    "转发": "forward", "转给": "forward",
 }
 
 _MENU = (
@@ -414,6 +601,8 @@ _MENU = (
     ("6", "看朋友圈", "moments"),
     ("7", "列出会话（不知道名字时先看这个）", "sessions"),
     ("8", "体检：账号 / 密钥 / 控件树", "doctor"),
+    ("9", "通讯录标签：看/建标签、给标签批量加移成员（会驱动微信窗口）", "labels"),
+    ("10", "右键转发一条消息：发给指定人或整个标签（先预演）", "forward"),
     ("0", "退出", None),
 )
 
@@ -483,6 +672,58 @@ def menu():
             if cmd in ("moments", "sessions", "doctor"):
                 a = p.parse_args([cmd])
                 rc = int(a.func(a) or 0)
+            elif cmd == "forward":
+                kind = _ask("转发给谁：l=整个标签 / n=指定的人（默认 l）：").strip().lower()
+                argv = ["forward"]
+                if kind == "n":
+                    argv += ["--to", _ask("收件人显示名，逗号分隔：")]
+                else:
+                    argv += ["--label", _ask("标签名：")]
+                who = _ask("在哪个会话里右键？直接回车=当前打开的会话：").strip()
+                if who:
+                    argv += ["--chat", who]
+                a = p.parse_args(argv)
+                rc = int(a.func(a) or 0)
+                # 菜单里也走「先预演、确认了才真发」那道闸（和 send 一样）
+                if rc == 0:
+                    if _ask("上面是预演，一条都没发。确认真发？(y=发)："
+                            ).strip().lower() in ("y", "yes"):
+                        a = p.parse_args(argv + ["--go"])
+                        rc = int(a.func(a) or 0)
+                    else:
+                        print("没确认，这次只到预演为止。")
+            elif cmd == "labels":
+                act = (_ask("list=看有哪些标签(不动窗口) / members=看某标签的人 / "
+                            "create=新建 / add=加成员 / remove=移成员 / "
+                            "rename=改名 / delete=删标签 / send=按标签群发 / "
+                            "probe=走一遍看哪步断：")
+                       or "list").strip()
+                if act not in ("list", "create", "add", "remove", "delete",
+                               "rename", "members", "send", "probe"):
+                    print("只认 list/members/create/add/remove/rename/delete/send/probe，"
+                          "这次按 list 走。")
+                    act = "list"
+                argv = ["labels", act]
+                if act != "list":
+                    argv += ["--label", _ask("标签名：")]
+                    if act == "rename":
+                        argv += ["--to", _ask("改成什么名字：")]
+                    if act in ("add", "remove"):
+                        argv += ["--members",
+                                 _ask("好友显示名，逗号分隔（例：小明,小红）：")]
+                    if act == "send":
+                        argv += ["--text", _ask("要发什么内容："), "--dry-run"]
+                a = p.parse_args(argv)
+                rc = int(a.func(a) or 0)
+                if act == "send" and rc == 0:
+                    # 群发是这个模块最贵的一档：上面那次是预演（--dry-run，一条都
+                    # 没发出去），把收件人念给用户看完才问要不要真发。
+                    if _ask("上面是预演，一条都没发。确认发给这些人？(y=发)："
+                            ).strip().lower() in ("y", "yes"):
+                        a = p.parse_args(argv + ["--go"])
+                        rc = int(a.func(a) or 0)
+                    else:
+                        print("没确认，这次只到预演为止。")
             else:
                 chat, keep = _pick_chat(db, keep)
                 if not chat:

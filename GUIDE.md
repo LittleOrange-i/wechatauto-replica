@@ -24,6 +24,8 @@
 8. [多账号 / Multi-account](#8-多账号--multi-account)
 9. [导出聊天记录 / Export](#9-导出聊天记录--exporting-chat-history)
 10. [群聊操作 / Group Chat](#10-群聊操作专题--group-chat-operations)
+10.5 [通讯录标签 / Contact Labels](#105-通讯录标签--contact-labels)
+10.6 [右键转发 / Forward a Message](#106-右键转发--forward-a-message)
 11. [常见问题与排错 / FAQ](#11-常见问题与排错--faq--troubleshooting)
 12. [API 速查表 / Quick Reference](#12-api-速查表--api-quick-reference)
 
@@ -810,6 +812,216 @@ md.download_voice("群名", local_id)      # 自动搜索所有 media_*.db / sea
 
 ---
 
+## 10.5 通讯录标签 / Contact Labels
+
+界面上的走法（微信 4.x PC，**全部按 4.1.15.13 真机实测的锚点实现**）：
+**通讯录 → 通讯录管理 → 标签**，左栏建标签，右键标签行「添加成员」勾人，
+选中成员后点底部「移出标签」。
+
+```python
+from wechatauto import WeChat, WeChatDB
+
+WeChatDB().list_labels()            # [{label_id, name, sort_order}] —— 只读库，不动窗口
+wx = WeChat()
+wx.ListLabels()                     # 同上（WxResponse 包装）
+wx.ListLabels(prefer="ui")          # 读管理窗左栏：是准数，还带人数（会动窗口）
+wx.CreateLabel("同事")              # 微信是「先建空标签、再改名」两步；已存在时直接算成功
+wx.RenameLabel("同事", "老同事")     # 只改名字：右键 →「修改标签名」→ 贴 → 回车（成员/label_id 不动）
+wx.AddLabelMembers("同事", ["小明", "wxid_abc123"])   # wxid 会自动换成界面显示名
+wx.RemoveLabelMembers("同事", ["小明"])               # 只去标签，不删好友
+wx.DeleteLabel("同事")              # 删标签（确认框文案就是「相关联系人不会被删除」）
+wx.LabelMembers("同事")             # 该标签的**全部**成员（靠滚动取全量，见 10.5.2）
+wx.SendToLabel("周五校庆放假", "同事", dry_run=True)   # 按标签批量发：先只解析收件人
+wx.SendToLabel("周五校庆放假", "同事", limit=1)        # 真发，先试一个人
+wx.ProbeLabels(dump_dir="label_probe")                # 只导航不写，报断在哪一步
+```
+
+一条命令版（中文子命令同样认）：
+
+```bash
+wechatauto 标签 list                          # 只读库，不动窗口
+wechatauto 标签 list --ui                     # 走界面核对（含人数；库里的删除会滞后）
+wechatauto 标签 create --label 同事
+wechatauto 标签 add    --label 同事 --members 小明,小红
+wechatauto 标签 remove --label 同事 --members 小明
+wechatauto 标签 delete --label 同事
+wechatauto 标签 rename --label 同事 --to 老同事
+wechatauto 标签 members --label 同学           # 滚动取全量：「显示 63 人，读到 63 人」
+wechatauto 标签 send    --label 同学 --text "…" --dry-run   # 只解析收件人，一笔都不发
+wechatauto 标签 send    --label 同学 --text "…" --go --limit 1
+wechatauto 标签 probe --dump label_probe      # 界面改版后先跑这个
+```
+
+`add` / `remove` 完成后会回报成员数变化（`成员数：63 → 65`）——那个数字是标签行
+Name 自带的（`同学(63)`），也是这件事最便宜的真值。
+
+### 10.5.1 八条实测出来的界面事实 / Eight measured facts
+
+1. **「通讯录管理」是独立顶层窗口**，不在主窗子树里；右键菜单、「微信添加成员」
+   选择框、删除确认框各是另一个小窗。所以查找的根按标题换：
+   `FindWindowW('Qt51514QWindowIcon', '通讯录管理')`。按主窗子树找 = 永远找不到，
+   表现就是「点了没反应」（同一个根因也解释了「搜索下拉点不中」那一类老问题）。
+2. **每次点击前抬窗 + 校验落点归属**（`WindowFromPoint` 的 root 必须就是目标窗口），
+   不匹配就返回 `occluded` 不投。用户的浏览器或图片预览窗盖住微信时，注入点击会
+   真的落到那个窗口上，而 UIA 读回来的还是微信的树——「没反应」和「点错地方」在
+   日志里长得一模一样。两个例外：**弹层不抬窗**（右键菜单一失焦就自己关掉），
+   而残留的「微信添加成员」**必须抬窗**才取消得掉（它是管理窗的 owned window，
+   抬管理窗抬不过它）。
+3. **行内改名没有可寻址的编辑框**：点「修改标签名」之后整棵树里只有搜索框，
+   `SetFocus` 反而会把编辑态取消。实测唯一可行的是「剪贴板 + Ctrl+V + 回车」。
+4. **管理窗留着上一次的滚动位置**：再点一次同一个标签行**不会**把右侧列表拨回
+   顶部。第一次真机跑 `标签 members` 就栽在这——它从中间开始数，数到「下面没新
+   行」就报「到底了」，63 人只读到 22 个。现在先 `_rewind()` 往上倒到不动为止。
+5. **滚轮只认小 delta，而且不等速**：一把 `-600` 发下去列表经常一动不动；每格
+   `120` 实测走 1~2 行，同一轮里 5~10 行不等。所以每轮只给 3 格（≈4 行，一屏
+   10~11 行 → 屏与屏还剩 6 行重叠），照 `find_in_message_list` 那条老路写。
+6. **「新建标签」产出的那一行是空名字、而且已经在行内编辑态**：实测新行 Name 是
+   `'(0)'`（要等提交才变成 `未命名(0)`）。两个坑叠在一起：① 用「滤掉空名」的
+   `label_rows()` 判有没有多出一行，永远看不见它 → `no-new-row`；② 这时候右键
+   **弹不出菜单** → 兜底的「修改标签名」也走不通。所以 `CreateLabel` 是先直接
+   「贴 + 回车」（`via='editing'`），没生效才退回右键改名（`via='menu'`）。
+7. **左栏「标签」那一组会被折叠起来，折叠时整组都不在 UIA 树里**：微信记住折叠
+   状态，折叠后左栏只剩 `全部 / 筛选 / 朋友权限 / 标签 / 最近群聊` 五个标题，
+   `无标签`、每个标签、`新建标签` **一行都读不到**——表现就是 `no-create` /
+   `no-label` / 空列表（用户报的）。点一下分组标题「标签」就全回来了，而且实测
+   **再点一次不会收起**，所以 `ensure_labels_open()` 里「已经展开就一下都不点、
+   没展开就点一次」是安全可重复的动作。`open_manager()` 每开一次窗都会先过它。
+8. **「窗口出现了」不等于「左栏画出来了」**：`FindWindowW` 拿到「通讯录管理」的
+   那一刻左栏可能还是空的——实测就这么把 4 个标签念成「共 0 个标签」还报了成功。
+   它和第 7 条撞在一起才真危险：**「读不到」既可能是没画完、也可能是折叠了**，
+   而按折叠去点标题会把一组只是晚画的行**折叠掉**。所以 `open_manager()` 在
+   `ensure_labels_open()` **之前**先等左栏出现内容（看见标签行、或看见「新建标签」
+   那一格都算画过了），等不到才按折叠处理。
+
+### 10.5.2 为什么成员只能按界面判 / Why membership is UI-only
+
+- 标签**定义**在 `contact.db:contact_label(label_id_, label_name_, sort_order_)`，
+  本机实测能直接读到，所以 `list_labels()` 完全不碰窗口。
+- 标签**成员**在本地库里读不到。全库扫过一遍：带 label/tag 字样的表只有
+  `contact_label`（只有定义）、收藏的 `fav_*_tag_*`、`general.db:FMessageTable.label_ids_`
+  （「新的朋友」验证消息上的字段，不是通讯录标签）。又按 protobuf 逐字段解过
+  `contact.extra_buffer` 里有值的 409 个联系人，没有取值 ⊆ 已知 label_id 的字段。
+  **定向差分**再验一次：给某个好友贴上 `演示标签`（label_id=6）之后，他在所有人里
+  独有的字段只有一个 `(field 41, varint 1753781804)`——那是个日期，不是 6。
+- 而且 `contact_label` **滞后于界面**：删掉标签后界面上那行立刻没了，解密库里还留着。
+  所以它只当辅助读，**校验一律看界面**（标签行的人数、选择框的「已选择N个联系人」）。
+
+**取全量怎么数才算数**（`LabelMembers` / `标签 members`）：倒回顶部 → 每轮 3 格往下滚
+→ 把每一屏**按重叠拼接**成一条序列。拼接而不是「按名字去重」是必需的：标签里真有
+重名的人，按名字去重时 63 人会只剩 54 行（实测）。最后一屏对不上上一屏（`gapped`）
+也只是线索，不当判据——整屏正好跳过去时两屏一个名字都接不上，却一行都没漏；**「取全
+了没有」只认微信自己在标签行上写的那个数**（`同学(63)` 对上 63 才算 `complete`），
+对不上就报 `incomplete` 并判失败，绝不当成功返回。
+
+### 10.5.3 按标签批量发送 / Send to a label
+
+```python
+wx.SendToLabel("周五校庆放假", "同学", dry_run=True)   # 只解析收件人，一笔都不发
+wx.SendToLabel("周五校庆放假", "同学", limit=1)        # 真发，先发一个人试水
+wx.ForwardToLabel("同学", text="周五校庆放假", dry_run=True)   # 先发给第一个人，再把这条转发给剩下的
+wx.ForwardMessage(["甲", "乙"], chat="文件传输助手", match="测试文本")  # 转发已有的一条
+```
+
+**转发要有物料**：右键转发的目标必须**已经在界面上存在**。所以给了 `text` 时走的是
+「先老老实实发给名单里第一个人 → 再回到那个会话，按正文定位那一条 → 右键转发给
+剩下的人」：第一个人拿**原件**、其余拿**转发件**，每人恰好一条，不会重发。第一条
+没发出去就整链停住（`seed-fail`）——不然右键到的会是会话里**别的**一条消息。
+中途失败时响应里点名「已发出 N 条」，因为照提示直接重跑会给第一个人发第二遍。
+
+三道闸，都是故意加的：
+
+1. **先读成员**（上面那套滚动枚举），读不全（`incomplete`）就直接失败——批量发送
+   把差掉的人默默跳过是最贵的一种错。
+2. **每个人都要在通讯录里唯一命中一个 wxid** 才进 `recipients`；重名的、查不到的
+   进 `data['skipped']` 交回来（真机实测：`同学` 63 人里有 4 个人的昵称只是一个
+   省略号、一个句号、一个感叹号、一个表情——通讯录里对着好几个人，所以一律不发，
+   不猜人）。
+3. `dry_run` 是 CLI 的默认，`--go` 才真发；菜单里跑 `send` 会先预演、把收件人念
+   出来，问过 `y` 才带 `--go` 走第二遍。发送本身复用 `Chat.SendMsg` 那条通道，每一笔
+   都过 `rhythm` 的拟人节流，`_send_cost_hint()` 会按当前档位先报一遍预计耗时。
+
+**失败一定带原因**：每一步返回结构化 `reason`（`no-tab` / `no-page` /
+`no-manager-row` / `no-manager-win` / `occluded` / `no-menu` / `no-create` /
+`no-new-row` / `not-renamed` / `no-picker` / `no-member` / `count-unchanged` /
+`still-there` …），并把当层能读到的控件名带回 `WxResponse.data`。界面文案随版本漂移时
+先跑 `标签 probe`，它把每一步的控件树写进 `--dump` 目录。
+
+> 状态：**建标签 / 加成员 / 移成员 / 删标签 / 读全量成员 / 按标签预演已在本机真机
+> 跑通**（2026-10-06：`同学` 微信显示 63 人 → 读到 63 人 `complete`，其中 59 人能
+> 唯一对上 wxid、4 个重名交回 `skipped`，`send --dry-run` 一笔都没发；探测时留下的
+> 两个空标签 `未命名` / `未命名1` 已真的删掉，账号回到 `同学(63)`、`大人(18)`）。
+> **真 `--go` 那一段仍未测**——它要往真人身上发消息，得由本人点头。离线自测
+> `python tools/test_labels.py`（98 项 + 20 个变异，每个变异都必须让某条判据变红）
+> 钉逻辑与失败原因；真机那一段需要解锁可见的桌面（见 AGENTS.md）。第 8 条（左栏晚画）
+> 是**真机撞出来的**，但修完那一刻微信已退出，只有离线判据 —— 复验要重开微信跑
+> `标签 list --ui`，在那之前算 未测。
+
+---
+
+## 10.6 右键转发 / Forward a Message
+
+把**已经在聊天里的一条消息**分别转发给若干人或整个标签，走的是界面右键那条路
+（不是重新打一遍正文，所以图片/文件/链接卡片都能原样转）。
+
+```python
+from wechatauto import WeChat
+
+wx = WeChat()
+wx.ForwardMessage(["文件传输助手", "送你挖银子"], chat="文件传输助手", dry_run=True)
+wx.ForwardMessage("小明", chat="某群", match="测试文本123")     # 按文字定位那一条
+wx.ForwardToLabel("同学", chat="文件传输助手", dry_run=True)     # 按标签：默认只预演
+wx.ForwardToLabel("同学", chat="文件传输助手", dry_run=False, chunk=9, limit=20)
+```
+
+```bash
+wechatauto 转发 --label 同学 --text "周五校庆放假" --dry-run     # 先发第一个人→再转发给剩下的人
+wechatauto 转发 --label 同学 --text "周五校庆放假" --go --chunk 9
+wechatauto 转发 --to 文件传输助手,送你挖银子 --chat 文件传输助手 --dry-run
+wechatauto forward --label 同学 --chat 文件传输助手 --match "测试文本" --go   # 转发已有的一条
+```
+
+节奏是**分小块多选**：一个「微信发送给」窗口勾 `chunk` 个人（默认 9），块与块之间过
+`rhythm`。63 人的标签不在同一个窗口里一次勾满——那等于一次点击把 63 条消息全砸出去，
+中间没有任何节流间隔。
+
+### 10.6.1 实测锚点（4.1.15.13）
+
+| 环节 | 控件 |
+|---|---|
+| 右键菜单 | 独立小窗（`Qt51514QWindowToolSaveBits`，标题 `Weixin`），项物化成主窗子树里的 `mmui::XMenuView`，Name=**`转发...`** |
+| 转发窗口 | **独立顶层窗口**，标题 `微信发送给`，根控件 `mmui::SessionPickerWindow` |
+| 左栏行 | `mmui::SPSelectionContactRow`（Name=显示名）；搜索后换成 `mmui::SearchContactCellView` |
+| 搜索框 | `mmui::XValidatorTextEdit` Name=「搜索」（和标签选择框同族，复选框也在行左缘 +70px） |
+| 已选收件人 | 右栏 `mmui::SPChoiceContactRow`，Name=**`移除<显示名>`** |
+| 发送按钮 | `mmui::XButton` aid=`confirm_btn`，Name=**`发送` / `分别发送(N)`**；取消是 aid=`cancel_btn` |
+| 留言框 | `mmui::ChatInputField` aid=`leave_message_view.chat_input_field` |
+
+### 10.6.2 发送前为什么要三个数对齐
+
+点一次「发送」= 往 N 个人各发一条，发出去收不回来。所以 `send()` 要三处读数一致才放行：
+
+1. **发送按钮上写的数字**（`分别发送(2)`；单选时是 `发送`，按 1 个人算）；
+2. **右侧已选栏里的人头**（`移除<显示名>` 的行数）；
+3. 调用方**预期**的人数（这一块实际勾中几个）。
+
+对不上就报 `count-mismatch` 停手；一个人都没选报 `no-recipient`。发出去之后还要
+**回读每个人的会话**：有比发送时刻更新的一行才算 `sent`，没有就进 `failed`——
+「窗口关了」不等于「每个人都收到了」。
+
+另外两条实测事实：**「分别发送」是给每个人单独发一条**（实测两个收件人会话里各新增
+一行同刻消息），以及**这个选择框和「标签→添加成员」是同一族控件**，所以 `forward.py`
+直接复用 `labels.py` 的窗口层与点击层。
+
+> 状态：开窗 / 勾选 / 人数闸门 / 取消 / 分块 / 预演 / 先发的原件 已由
+> `python tools/test_forward.py`（59 项 + 7 个变异）钉住；真机上生产代码这条路也跑通了
+> ——`forward --to 文件传输助手,送你挖银子 --go` 勾 2 人 → 按钮写 `分别发送(2)` → 发送 →
+> 两个会话各落一条同刻的图片消息（独立回读复核过，不是自测自己发的那条）。
+> 「先发给第一个人再转发给剩下的人」这条**只跑过离线判据**：要真机验得开着微信，
+> 写这一段时微信已经退出了 —— 算 未测。
+> **往别人身上批量转发没有自动试过**，需要本人明确下达 `--go`。
+
+---
+
 ## 11. 常见问题与排错 / FAQ & Troubleshooting
 
 ### Q1: `RuntimeError: 数据库无可用密钥` / no usable DB key
@@ -954,6 +1166,13 @@ md.download_voice("群名", local_id)      # 自动搜索所有 media_*.db / sea
 | `Poke()` | 拍一拍 / poke |
 | `RecallLastMessage()` | 撤回最近消息 / recall latest message |
 | `ForwardVoiceMessage(target)` | 转发语音 / forward voice |
+| `ListLabels()` / `CreateLabel(name)` | 标签：读（走库）/ 建（走界面）/ list & create labels |
+| `AddLabelMembers(label, who)` / `RemoveLabelMembers(label, who)` | 批量加/移成员（只去标签，不删好友）|
+| `LabelMembers(label, limit)` | 某标签的**全部**成员（滚动取全量，带 `complete`）|
+| `SendToLabel(text, label, dry_run, limit)` | 按标签批量发；`dry_run` 只解析收件人 |
+| `ForwardMessage(to, chat, match, dry_run)` | 右键「转发」一条消息给若干人（分小块多选）|
+| `ForwardToLabel(label, chat, dry_run, chunk)` | 按标签分别转发；默认只预演 |
+| `ProbeLabels(dump_dir)` | 只导航不写，报断在哪一步 / path probe |
 | `AddListenChat(nickname, cb)` | 监听（WeChat）/ listen |
 | `KeepRunning()` | 阻塞保持运行 / block & stay alive |
 
