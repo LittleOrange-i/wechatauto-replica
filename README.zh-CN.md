@@ -19,7 +19,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.4.4
+> 当前版本：1.2.5
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.13 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -76,6 +76,26 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 ---
 
 ## 版本记录
+
+### v1.2.5（2026-10-07）
+
+- **新增：通讯录标签 + 右键转发。** 走法按 4.1.15.13 真机实测的锚点实现（通讯录 → 通讯录管理 → 标签）。
+  - `WeChat` 增 12 个方法：`ListLabels(prefer='db'/'ui')` / `CreateLabel` / `RenameLabel` / `AddLabelMembers` / `RemoveLabelMembers` / `DeleteLabel` / `LabelMembers` / `SendToLabel` / `ForwardMessage` / `ProbeLabels`；`wxid` 自动换成界面显示名，`RenameLabel` 只改名字不动成员和 `label_id`。
+  - **先预演再真发**：`SendToLabel(text, label, dry_run=True)` 只解析收件人、一次界面都不碰，`limit=1` 先试一个人；`WeChatDB().list_labels()` 是纯读库。`ProbeLabels` 只导航不写，报断在哪一步。
+  - CLI 加 `labels` / `forward` 两个子命令和菜单两项（`9` 标签、`10` 转发），中英都收（`标签`/`打标签`、`转发`/`转给`）。指南新增 §10.5 通讯录标签、§10.6 右键转发。
+- **新增：发送前回读校验 `WxParam.SEND_CONTENT_RATIO`（默认 0.6，`<=0` 关闭）。** `Ctrl+V` 有可能整个落空（微信不在前台、焦点没落到输入框上），这时按键照样打下去，发出去的是空消息或上一轮残留的内容——老代码还把那个异常吞了、照样返回成功。现在 UIA 主路径与 OCR/坐标路径两条都在回车前回读输入框比对，判不达标就不回车、清空输入框、返回失败让上层重试，并且不占用 `rhythm` 的写动作额度。
+  - 阈值为什么不照抄更高的 0.9：真机实测一条带表情码的正常消息只有 **0.884**，8 字中文差一个字是 **0.875**——定 0.9 会把好消息拦死；而读回空是 0.0、残留内容是 0.11，0.6 都拦得住。
+  - 表情码口径（实测）：`[微笑]` 在输入框里是 1 个 `U+FFFC`，落库正文才是原样 `[微笑]`（发送时才转）。比对前两侧折算，折算后 1.0。**代价**：折算后 `[微笑]` 与 `[发怒]` 不可分辨，表情码打错不会被这道闸拦下。
+- **新增：`WxParam.ENABLE_OCR`（默认 `True`，行为不变）。** OCR 识别不准时一键停用。总闸放在引擎入口 `ScreenOCR.recognize()`（`ocr()` / `ocr_zoomed()` 额外在截图前短路，连抓屏都省掉）——调用点散在 `guia` / `moment` / `uia_driver` 三个模块共 20 处，逐处加开关迟早漏，所以另加一条静态断言锁住「全库只有 `guia.py` 直接引用 `OcrEngine`」。关掉后能走 UIA 的改走 UIA，**没有 UIA 等价物的操作明确失败而不是盲点坐标**：侧栏查找、搜索下拉点选、「发送」按钮兜底、朋友圈元素、转发/多选菜单。像素探针类（输入框定位、面板非空白、高亮行检测）不是 OCR，照常工作。
+- **新增：前台收尾 API。** `ensure_visible(keep_topmost=…)` 参数化；`_minimize_blockers()` 现在给被它最小化的遮挡窗口记账，新增 `restore_blockers()`（只还原自己按下去的那些，且用不抢前台的方式）和 `release_foreground()`（取消置顶 + 还原遮挡）。
+- **修复：`current_chat()` 一直带着输入框的占位符尾巴。** 微信把「会话名 + 占位符」拼在控件 `Name` 里（本机实测「文件传输助手」→ `文件传输助手按住鼠标 语音输入文字`），于是全库 `current_chat() == who` **一次都没成立过**：会话明明已经打开，`open_chat` 照样返回 False，发送被推去走慢且更易错的坐标路径，连续发送的快速路径也永不触发。现在剥掉已知尾巴；未收录的尾巴原样返回（行为同旧版）。
+- **修复：置顶在 64 位 Python 下从来没生效过。** `SetWindowPos(hwnd, -1, …)` 把 `-1` 当 32 位整数塞进 `HWND` 参数，调用直接返回 0（`last_error 1400`），改用 `ctypes.c_void_p(-1)` / `c_void_p(-2)`。⚠️ **行为变化**：置顶现在真的会生效——`ensure_visible()` 默认 `keep_topmost=True`，批量发送期间微信会压在桌面上所有窗口之上，收尾请调 `release_foreground()`。
+- **修复：前台锁设成 0 之后不再还原。** `SPI_SETFOREGROUNDLOCKTIMEOUT` 是**全机**设置，一直留着 0 会削弱所有程序的前台保护（不只微信）。现在先读原值、结束时恢复；顺带发现数值必须放在 `pvParam` 才写得进去（放 `uiParam` 直接返回 FALSE、值不变）。
+- **修复：剪贴板被别的进程占用时异常冒出 `send_msg` 变成 traceback**（真机撞到过一次 `PyperclipWindowsException: Error calling OpenClipboard`）。`set_clipboard()` 改为返回 `bool` 并兜住异常，调用方按「这次输入失败」重试或明确失败。
+- **改进：`_chat_is_open` 改为 UIA 优先、OCR 兜底**——UIA 命中时不再多花一次放大 OCR 和一次截图。
+- **兼容性**：接口签名一字未改；`set_clipboard()` 返回值从 `None` 变成 `bool`，调用点判据写的是 `is False` 而不是 `not …`，所以覆盖它、仍返回 `None` 的老代码不会被误判成失败。无新增依赖。
+- **回归**：`tools/selftest.py` **496 项 0 失败**。新增 4 个离线套件——`test_send_verify` 21、`test_ocr_send_gate` 26、`test_ocr_switch` 21、`test_chat_identity` 21；标签/转发沿用 `test_labels` 98、`test_forward` 59。真机：UIA 路径与 UIA-only（`ENABLE_OCR=False`）各发一条，数据库回读**逐字一致**；模拟「送给空气」→ 读回 `''`、相似度 0.000、一次都没回车；置顶设置与解除闭环真机验过。
+- **未测（如实说明）**：① 其它微信版本的占位符尾巴（未命中就退回旧行为，不会崩）；② `ENABLE_OCR=False` 时朋友圈 / 转发的实际降级表现，离线只证明了「不会去调 OCR」；③ `SendToLabel` 的批量真发（`--go`），会发给别人，没跑过；④ 闸持续判不符时 `send_msg` 要跑满 3 次尝试（实测 56.9s）才失败，没做提前短路；⑤ `bring_to_front` 中途抛异常时前台锁不恢复（包 `try/finally` 要给整段循环改缩进，风险大于收益）。
 
 ### v1.2.4.4（2026-10-03）
 
@@ -500,6 +520,8 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 | 发送消息 | ✅ 已完成并验证 | UIA + 坐标+OCR 混合（`wechatauto/guia.py`） |
 | 发送文件/图片/回复/艾特 | ✅ 已完成并验证 | 剪贴板 CF_HDROP + OCR |
 | 语音通话 / 拍一拍 | ✅ 已完成并验证 | UIA 按钮 + OCR 菜单（`Chat.VoiceCall` / `Chat.Poke`） |
+| 通讯录标签 / 右键转发 | ✅ 已实现；批量真发（会发给别人）**未验** | `ListLabels` / `CreateLabel` / `AddLabelMembers` / `SendToLabel(dry_run=)` / `ForwardMessage`，CLI `labels` / `forward` |
+| 发送前回读校验 + OCR 总开关 | ✅ 已验证（离线 89 项 + 真机逐字回读） | `WxParam.SEND_CONTENT_RATIO`（默认 0.6）、`WxParam.ENABLE_OCR`（默认开） |
 | UI 自动化（UIAutomation） | ✅ 热激活后可用 | 写 Weixin.dll Qt accessibility gate，物化 `mmui::*` 树 |
 
 **结论**：微信 4.1.x 聊天界面使用自绘渲染（`MMUIRenderSubWindow*`），冷启动

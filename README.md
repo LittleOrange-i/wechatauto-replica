@@ -17,7 +17,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.4.4 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
+> **Current version:** 1.2.5 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -42,6 +42,8 @@ Automate the **WeChat 4.x Windows desktop client** (not the web version): read m
 | Send text / file / image / reply / @member | ✅ verified | UIA-first, coordinate + OCR fallback |
 | Voice call / Poke (拍一拍) | ✅ verified | UIA buttons + OCR menus |
 | UIAutomation tree | ✅ after hot-activation | Writes the Qt accessibility gate inside Weixin.dll |
+| Contact labels / forward a message | ✅ implemented; the live batch send is **not** verified | `ListLabels` / `CreateLabel` / `AddLabelMembers` / `SendToLabel(dry_run=)` / `ForwardMessage`, CLI `labels` / `forward` |
+| Read-back gate before Enter + master OCR switch | ✅ verified (89 offline checks + verbatim live read-back) | `WxParam.SEND_CONTENT_RATIO` (0.6), `WxParam.ENABLE_OCR` (on) |
 
 ## 🚀 Quick Start
 
@@ -215,6 +217,26 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.5 (2026-10-07)
+
+- **New: contact labels + forwarding a message**, implemented against the anchors measured on the live 4.1.15.13 client (Contacts → Contact management → Labels).
+  - 12 new `WeChat` methods: `ListLabels(prefer='db'/'ui')` / `CreateLabel` / `RenameLabel` / `AddLabelMembers` / `RemoveLabelMembers` / `DeleteLabel` / `LabelMembers` / `SendToLabel` / `ForwardMessage` / `ProbeLabels`; wxids are resolved to display names automatically and `RenameLabel` changes only the name (members and `label_id` untouched).
+  - **Rehearse before you send**: `SendToLabel(text, label, dry_run=True)` only resolves recipients and never touches the window, `limit=1` tries one person first; `WeChatDB().list_labels()` is a pure DB read. `ProbeLabels` navigates without writing and reports which step breaks.
+  - The CLI gains `labels` / `forward` subcommands plus two menu entries, accepting Chinese and English aliases alike. Guide sections §10.5 and §10.6 added.
+- **New: read-back gate before Enter — `WxParam.SEND_CONTENT_RATIO` (default 0.6, `<=0` disables).** `Ctrl+V` can miss entirely (WeChat not in the foreground, focus not on the input field), and the keystroke used to go through anyway, sending an empty message or the previous draft — while the exception was swallowed and success was reported. Both the UIA path and the coordinate/OCR path now read the input box back before pressing Enter; on a mismatch they clear the box, return failure for the caller to retry, and do not consume the `rhythm` write budget.
+  - Why 0.6 rather than a higher number: measured on the live client, an ordinary message containing an emoji codes scores **0.884**, and one wrong character in an 8-character Chinese sentence scores **0.875** — 0.9 would block good sends. An empty read-back is 0.0 and a stale draft 0.11, both caught.
+  - Emoji codes (measured): `[微笑]` becomes a single `U+FFFC` inside the input box, while the stored message keeps the literal text (WeChat converts on send). Both sides are folded before comparing, giving 1.0. **Trade-off**: after folding, `[微笑]` and `[发怒]` are indistinguishable, so a wrong emoji code is not caught by this gate.
+- **New: `WxParam.ENABLE_OCR` (default `True`, behaviour unchanged).** One switch to stop OCR when recognition is unreliable. It sits at the engine entry `ScreenOCR.recognize()` (plus short-circuits in `ocr()` / `ocr_zoomed()` that skip the screenshot itself), because 20 call sites are spread over `guia`, `moment` and `uia_driver` — a static assertion now pins that `guia.py` is the only module referencing `OcrEngine`. With it off, anything that can go through the UIA tree does; operations with **no UIA equivalent fail explicitly instead of clicking on guessed coordinates**: sidebar session lookup, search dropdown, the "send" button fallback, Moments elements, forward/multi-select menus. Pixel probes (input-box location, non-blank pane, highlighted row) are not OCR and keep working.
+- **New: foreground cleanup API.** `ensure_visible(keep_topmost=…)` is now a parameter; `_minimize_blockers()` records the foreign windows it minimized, with new `restore_blockers()` (restores only what it actually minimized, without stealing focus) and `release_foreground()` (un-topmost + restore blockers).
+- **Fixed: `current_chat()` used to carry the input box's placeholder tail.** WeChat puts "session name + placeholder" in the control's `Name` (measured: `文件传输助手` → `文件传输助手按住鼠标 语音输入文字`), so **every `current_chat() == who` comparison in the library could never be true**: an already-open chat still made `open_chat` return False, sends fell to the slow, error-prone coordinate path, and the consecutive-send fast path never triggered. Known tails are now stripped; unknown ones return the name unchanged (behaviour as before).
+- **Fixed: topmost never actually worked on 64-bit Python.** `SetWindowPos(hwnd, -1, …)` passed `-1` as a 32-bit integer into an `HWND` parameter, so the call returned 0 (`last_error 1400`); it now uses `ctypes.c_void_p(-1)` / `c_void_p(-2)`. ⚠️ **Behaviour change**: topmost now really applies — `ensure_visible()` defaults to `keep_topmost=True`, so WeChat sits above every other window during a batch; call `release_foreground()` when the batch is done.
+- **Fixed: the foreground lock was set to 0 and never restored.** `SPI_SETFOREGROUNDLOCKTIMEOUT` is a **machine-wide** setting; leaving it at 0 weakens foreground-stealing protection for all processes, not just WeChat. The original value is now read back and restored on return — and it turned out the value only takes effect in `pvParam` (passing it in `uiParam` returns FALSE and changes nothing).
+- **Fixed: a clipboard held by another process raised straight through `send_msg` as a traceback** (`PyperclipWindowsException: Error calling OpenClipboard`, hit live once). `set_clipboard()` now returns a `bool` and contains the exception; callers treat a failure as "this input attempt failed" and retry or fail cleanly.
+- **Improved: `_chat_is_open` prefers UIA and falls back to OCR** — when UIA answers, no magnified OCR pass and no extra screenshot are spent.
+- **Compatibility**: no signature changes; `set_clipboard()` returns `bool` instead of `None`, and call sites test `is False` rather than `not …`, so overrides that still return `None` are not misread as failures. No new dependencies.
+- **Regressions**: `tools/selftest.py` **496 checks / 0 failures**. Four new offline suites — `test_send_verify` 21, `test_ocr_send_gate` 26, `test_ocr_switch` 21, `test_chat_identity` 21; labels/forward keep `test_labels` 98 and `test_forward` 59. Live: one send through the UIA path and one through UIA-only (`ENABLE_OCR=False`) both read back **verbatim** from the database; the simulated "paste into thin air" scored 0.000 and pressed no Enter; the topmost set/release cycle was verified on the live window.
+- **Not verified (stated plainly)**: placeholder tails on other WeChat builds (unknown ones fall back to old behaviour, no crash); the actual degraded behaviour of Moments/forward with `ENABLE_OCR=False` (offline only proves OCR is not called); `SendToLabel` in a real batch (`--go`) because it writes to other people; `send_msg` still spends 3 attempts (measured 56.9 s) before failing when the gate keeps rejecting; the foreground lock is not restored if `bring_to_front` raises mid-loop.
 
 ### v1.2.4.4 (2026-10-03)
 
